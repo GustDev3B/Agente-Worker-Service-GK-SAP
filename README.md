@@ -1,30 +1,32 @@
 # Monitor de Migración GK → SAP — Worker Service
 
-Versión Worker Service del agente de monitoreo GK→SAP.
+Agente autónomo que monitorea la correcta migración de datos de ventas y devoluciones desde GK (punto de venta) hacia SAP (ERP). El LLM controla el flujo de ejecución mediante tool calling — no hay lógica REINTENTAR/FINALIZAR hardcodeada en C#.
 
 ---
 
-## Cómo Ejecutar
+## Requisitos
 
-```bash
-cd "C:\Projects\agents\agent worker gk-sap"
-dotnet run --project Agent.Worker
-```
+- .NET 9 SDK
+- API key de Claude o Groq (ver Configuración)
+- Seq (opcional, para visualizar logs)
 
 ---
 
-## Configuración (`Agent.Worker/appsettings.json`)
+## Configuración
+
+Copiar `Agent.Worker/appsettings.example.json` a `Agent.Worker/appsettings.json` y completar:
 
 ```json
 {
   "ConnectionStrings": {
     "AgentDB":     "Data Source=agent_memory.db",
-    "AgentEvents": "Host=localhost;Port=5432;Database=agent_events;Username=postgres;Password=postgres"
+    "AgentEvents": ""
   },
   "LLM": {
-    "Provider":    "Ollama",
-    "OllamaUrl":   "http://localhost:11434",
-    "OllamaModel": "llama3"
+    "ClaudeApiKey":  "",
+    "ClaudeModel":   "claude-haiku-4-5-20251001",
+    "GroqApiKey":    "",
+    "GroqModel":     "llama-3.1-8b-instant"
   },
   "MigrationMonitor": {
     "IntervaloMinutos":     5,
@@ -33,58 +35,130 @@ dotnet run --project Agent.Worker
     "MaximoIntentos":       15,
     "Tolerancia":           0.01,
     "ModoSimulacionCorreo": true,
-    "ToAddress":            "destinatario@empresa.com",
+    "ToAddress":            "correo@empresa.com",
+    "EndpointUrl":          "http://servidor/api/endpoint",
     "FechaMonitoreo":       ""
   },
   "Seq": { "Url": "http://localhost:5341" }
 }
 ```
 
-| Parámetro              | Descripción                                              |
-|------------------------|----------------------------------------------------------|
-| `AgentDB`              | SQLite — memoria operacional (historial de iteraciones)  |
-| `AgentEvents`          | PostgreSQL — eventos consumibles (omitir = SQLite local) |
-| `LLM:Provider`         | `"Ollama"` o `"Mock"` (sin LLM real)                    |
-| `IntervaloMinutos`     | Espera entre reintentos del agente                       |
-| `HoraInicio`/`HoraFin` | Ventana de monitoreo diaria                              |
-| `MaximoIntentos`       | Límite de iteraciones antes de forzar notificación       |
-| `Tolerancia`           | Diferencia máxima aceptable por tienda (decimal)         |
-| `ModoSimulacionCorreo` | `true` = no envía correo real, solo loguea               |
-| `FechaMonitoreo`       | Fecha a verificar (`yyyy-MM-dd`). Vacío = hoy            |
+| Parámetro              | Descripción                                                        |
+|------------------------|--------------------------------------------------------------------|
+| `AgentDB`              | SQLite — memoria operacional (historial de iteraciones)            |
+| `AgentEvents`          | PostgreSQL — eventos consumibles. Vacío = SQLite fallback          |
+| `ClaudeApiKey`         | API key de Anthropic. Si está presente, se usa Claude              |
+| `GroqApiKey`           | API key de Groq. Se usa si no hay ClaudeApiKey                     |
+| `IntervaloMinutos`     | Espera entre reintentos del agente                                 |
+| `HoraInicio`/`HoraFin` | Ventana de monitoreo diaria (soporta cruce de medianoche)         |
+| `MaximoIntentos`       | Límite de iteraciones antes de forzar finalización                 |
+| `Tolerancia`           | Diferencia máxima aceptable por tienda (decimal)                   |
+| `ModoSimulacionCorreo` | `true` = no envía correo real, solo loguea                        |
+| `FechaMonitoreo`       | Fecha a verificar (`yyyy-MM-dd`). Vacío = hoy                     |
+
+**Selección automática de LLM:** si `ClaudeApiKey` está configurada se usa Claude; si no, Groq. Si ninguna está configurada, el Worker no arranca.
 
 ---
 
-## Cómo Correr Ollama
+## Ejecutar en desarrollo
 
-```bash
-# Instalar desde https://ollama.com/
-ollama pull llama3
-
-# Verificar disponibilidad
-curl http://localhost:11434/api/tags
+```powershell
+cd "C:\Projects\agents\agent worker gk-sap"
+dotnet run --project Agent.Worker
 ```
 
-Para ejecutar sin Ollama:
-```json
-"LLM": { "Provider": "Mock" }
+El agente ejecuta el ciclo inmediatamente al arrancar (sin esperar `HoraInicio`), útil para pruebas.
+
+---
+
+## Instalar como servicio de Windows
+
+### 1. Publicar
+
+```powershell
+dotnet publish "C:\Projects\agents\agent worker gk-sap\Agent.Worker" -c Release -o "C:\Services\MonitorGkSap"
+```
+
+### 2. Copiar configuración
+
+`appsettings.json` no se publica (está en `.gitignore`), copiarlo manualmente:
+
+```powershell
+Copy-Item "C:\Projects\agents\agent worker gk-sap\Agent.Worker\appsettings.json" "C:\Services\MonitorGkSap\"
+```
+
+### 3. Instalar el servicio (PowerShell como Administrador)
+
+```powershell
+sc.exe create MonitorGkSap binPath="C:\Services\MonitorGkSap\Agent.Worker.exe" start=auto
+sc.exe description MonitorGkSap "Agente autónomo de monitoreo de migración GK→SAP"
+```
+
+### 4. Iniciar
+
+```powershell
+sc.exe start MonitorGkSap
+```
+
+### Comandos útiles
+
+```powershell
+sc.exe stop    MonitorGkSap          # detener
+sc.exe start   MonitorGkSap          # iniciar
+sc.exe delete  MonitorGkSap          # desinstalar (detener primero)
+sc.exe query   MonitorGkSap          # ver estado
+```
+
+También se puede gestionar desde `services.msc` buscando "MonitorGkSap".
+
+### Actualizar el servicio
+
+```powershell
+sc.exe stop MonitorGkSap
+dotnet publish "C:\Projects\agents\agent worker gk-sap\Agent.Worker" -c Release -o "C:\Services\MonitorGkSap"
+sc.exe start MonitorGkSap
 ```
 
 ---
 
-## Cómo Abrir Seq
+## Seguimiento en tiempo real
 
-```bash
+### Consola / logs del servicio
+
+Cada herramienta que invoca el LLM aparece en los logs:
+
+```
+[16:05:01 INF] [Agente] Iniciando sesión a1b2c3d4 para fecha 2026-05-07
+[16:05:02 INF] [Agente] Ejecutando herramienta: obtener_estado_migracion
+[16:05:03 INF] [Agente] Ejecutando herramienta: registrar_iteracion
+[16:05:03 INF] [Agente] Ejecutando herramienta: esperar_y_reintentar
+[16:05:03 INF] [Agente] Esperando 5.0 min antes de reintentar...
+[16:10:04 INF] [Agente] Ejecutando herramienta: obtener_estado_migracion
+[16:10:05 INF] [Agente] Ejecutando herramienta: enviar_notificacion
+[16:10:05 INF] [Agente] Ejecutando herramienta: publicar_evento
+[16:10:05 INF] [Agente] Ejecutando herramienta: finalizar
+[16:10:05 INF] [Agente] Sesión a1b2c3d4 finalizada por herramienta.
+```
+
+Para ver logs de un servicio Windows en tiempo real:
+
+```powershell
+# Logs del Event Viewer de Windows
+Get-EventLog -LogName Application -Source MonitorGkSap -Newest 50
+```
+
+### Seq (recomendado)
+
+```powershell
 # Con Docker
 docker run --name seq -e ACCEPT_EULA=Y -p 5341:5341 -p 80:80 datalust/seq
-
-# Abrir: http://localhost
 ```
 
-Seq recibe únicamente **logs técnicos** (errores, performance, debugging).
+Abrir `http://localhost` — permite filtrar por `SessionId`, nivel, herramienta, etc.
 
 ---
 
-## Cómo Consultar Memoria Operacional (SQLite)
+## Consultar memoria operacional (SQLite)
 
 ```bash
 sqlite3 agent_memory.db
@@ -93,81 +167,45 @@ sqlite3 agent_memory.db
 ```sql
 -- Sesiones recientes
 SELECT SessionId, COUNT(*) iteraciones, MAX(Timestamp) ultima
-FROM MigrationMonitorLogs GROUP BY SessionId ORDER BY ultima DESC;
+FROM MigrationMonitorLogs
+GROUP BY SessionId ORDER BY ultima DESC;
 
 -- Detalle de una sesión
 SELECT Iteracion, Timestamp, CantidadErrores, DiferenciaTotal, Decision
-FROM MigrationMonitorLogs WHERE SessionId = 'abc12345' ORDER BY Iteracion;
+FROM MigrationMonitorLogs
+WHERE SessionId = 'a1b2c3d4' ORDER BY Iteracion;
 ```
 
 ---
 
-## Cómo Consultar Eventos (PostgreSQL)
+## Consultar eventos consumibles
+
+Si PostgreSQL está configurado:
 
 ```sql
--- Eventos pendientes
-SELECT id, session_id, event_type, timestamp
-FROM "AgentEvents" WHERE consumed = false ORDER BY timestamp;
-
--- Resumen por tipo
-SELECT event_type, COUNT(*) total
-FROM "AgentEvents" GROUP BY event_type ORDER BY total DESC;
-
--- Sesiones que finalizaron OK
-SELECT payload->>'sessionId', payload->>'fecha'
+SELECT event_type, payload, timestamp
 FROM "AgentEvents"
-WHERE event_type = 'MigracionOk' ORDER BY timestamp DESC;
+WHERE consumed = false ORDER BY timestamp;
 ```
 
-Si PostgreSQL no está configurado, los eventos se guardan en `agent_events_fallback.db` (SQLite).
-
----
-
-## Flujo del Agente
-
-```
-Worker inicia
-  │
-  ├─► Inicializa SQLite (memoria) + PostgreSQL (eventos)
-  │
-  └─► LOOP PERMANENTE
-        │
-        ├─► Publica: SesionIniciada
-        │
-        ├─► Delega a MigrationMonitorAgent.ExecuteAsync()
-        │     (lógica del proyecto console, sin modificar)
-        │     ├── percibir: GET endpoint GK/SAP
-        │     ├── razonar: validar + historial + Ollama
-        │     ├── decidir: REINTENTAR o FINALIZAR
-        │     ├── actuar: enviar notificación
-        │     └── recordar: guardar en SQLite
-        │
-        ├─► Lee resultado desde SQLite
-        ├─► Publica eventos según resultado:
-        │     ├── DiscrepanciaDetectada (si hubo errores)
-        │     ├── MigracionOk (si todo OK)
-        │     ├── LimiteIntentosAlcanzado (si se agotaron intentos)
-        │     ├── NotificacionEnviada
-        │     └── SesionFinalizada
-        │
-        └─► Espera hasta HoraInicio del día siguiente
-```
+Si no, los eventos están en `agent_events_fallback.db` (SQLite).
 
 ---
 
 ## Troubleshooting
 
-**Ollama no disponible:** Cambiar `LLM:Provider` a `"Mock"`.
+**No arranca — "No hay LLM configurado":** Agregar `ClaudeApiKey` o `GroqApiKey` en `appsettings.json`.
 
-**PostgreSQL no disponible:** El Worker usa `agent_events_fallback.db` (SQLite). Log: `[WRN] PostgreSQL no configurado...`
+**Groq devuelve 429:** Límite de tokens por minuto del plan gratuito alcanzado. El agente reintenta automáticamente hasta 3 veces esperando 45 segundos entre intentos.
 
-**Fuera de ventana horaria:** El agente espera automáticamente hasta `HoraInicio`. Normal en ejecuciones diurnas.
+**PostgreSQL no disponible:** El Worker usa `agent_events_fallback.db`. Log: `[WRN] PostgreSQL no configurado. Usando SQLite como fallback`.
 
 **ModoSimulacionCorreo:** Siempre `true` por defecto. Cambiar a `false` solo en producción verificada.
 
 **Compilar la solución:**
-```bash
-dotnet build AgentWorkerSolution.sln
+
+```powershell
+dotnet build "C:\Projects\agents\agent worker gk-sap\AgentWorkerSolution.sln"
 ```
 
-Ver [AGENTS.md](AGENTS.md) para documentación técnica completa.
+Ver [AGENTS.md](AGENTS.md) para documentación técnica completa de la arquitectura.
