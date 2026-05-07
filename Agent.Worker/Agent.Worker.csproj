@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>agent-worker-gk-sap</UserSecretsId>
+    <RootNamespace>Agent.Worker</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Host & Worker -->
+    <PackageReference Include="Microsoft.Extensions.Hosting"               Version="9.0.4" />
+    <PackageReference Include="Microsoft.Extensions.Http"                  Version="9.0.4" />
+
+    <!-- EF Core: SQLite (memoria operacional) -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite"       Version="9.0.4" />
+
+    <!-- EF Core: PostgreSQL (eventos consumibles) -->
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL"      Version="9.0.3" />
+
+    <!-- Serilog -->
+    <PackageReference Include="Serilog"                                    Version="4.1.0" />
+    <PackageReference Include="Serilog.Extensions.Hosting"                 Version="8.0.0" />
+    <PackageReference Include="Serilog.Extensions.Logging"                 Version="8.0.0" />
+    <PackageReference Include="Serilog.Settings.Configuration"             Version="8.0.4" />
+    <PackageReference Include="Serilog.Sinks.Console"                      Version="6.0.0" />
+    <PackageReference Include="Serilog.Sinks.Seq"                          Version="8.0.0" />
+    <PackageReference Include="Serilog.Enrichers.Environment"              Version="3.0.1" />
+    <PackageReference Include="Serilog.Enrichers.Thread"                   Version="4.0.0" />
+  </ItemGroup>
+
+  <!-- Referencias al proyecto console existente (SIN modificarlo) -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\control de monitoreo gk-sap console\Agent.Core\Agent.Core.csproj" />
+    <ProjectReference Include="..\..\control de monitoreo gk-sap console\Agent.Tools\Agent.Tools.csproj" />
+    <ProjectReference Include="..\..\control de monitoreo gk-sap console\Agent.Infrastructure\Agent.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>
