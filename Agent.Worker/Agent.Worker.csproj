@@ -11,6 +11,7 @@
   <ItemGroup>
     <!-- Host & Worker -->
     <PackageReference Include="Microsoft.Extensions.Hosting"               Version="9.0.4" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="9.0.4" />
     <PackageReference Include="Microsoft.Extensions.Http"                  Version="9.0.4" />
 
     <!-- EF Core: SQLite (memoria operacional) -->

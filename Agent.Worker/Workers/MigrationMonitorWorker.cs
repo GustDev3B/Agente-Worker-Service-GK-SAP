@@ -42,6 +42,16 @@ public class MigrationMonitorWorker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            var esperaInicio = CalcularEsperaHastaInicio();
+            if (esperaInicio > TimeSpan.Zero)
+            {
+                _logger.LogInformation(
+                    "Fuera de ventana de monitoreo. Próximo ciclo en {Horas:F1}h (a las {Hora}).",
+                    esperaInicio.TotalHours, _config.HoraInicio);
+                await Task.Delay(esperaInicio, stoppingToken);
+                continue;
+            }
+
             try
             {
                 await EjecutarCicloAsync(stoppingToken);
@@ -69,9 +79,15 @@ public class MigrationMonitorWorker : BackgroundService
         using var scope = _scopeFactory.CreateScope();
         var agent = scope.ServiceProvider.GetRequiredService<MigrationAgent>();
 
-        _logger.LogInformation("Iniciando ciclo del agente autónomo...");
+        // CancellationToken que expira al llegar HoraFin
+        var tiempoHastaFin = CalcularTiempoHastaFin();
+        using var ctsFin   = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        ctsFin.CancelAfter(tiempoHastaFin);
 
-        // Publicar inicio de sesión
+        _logger.LogInformation(
+            "Iniciando ciclo. Ventana activa por {Min:F0} minutos (hasta {Fin}).",
+            tiempoHastaFin.TotalMinutes, _config.HoraFin);
+
         var sessionId = Guid.NewGuid().ToString("N")[..8];
         await PublicarEventoAsync(sessionId, AgentEventTypes.SesionIniciada, new
         {
@@ -81,26 +97,28 @@ public class MigrationMonitorWorker : BackgroundService
             intervaloMinutos = _config.IntervaloMinutos
         }, ct);
 
-        // Ejecutar el agente: el LLM controla el flujo completo
-        var ctx = await agent.ExecuteAsync(sessionId, ct);
+        AgentContext ctx;
+        try
+        {
+            ctx = await agent.ExecuteAsync(sessionId, ctsFin.Token);
+        }
+        catch (OperationCanceledException) when (ctsFin.Token.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            _logger.LogWarning("Ciclo interrumpido al llegar HoraFin ({Fin}).", _config.HoraFin);
+            await TryPublicarErrorAsync($"Ciclo interrumpido al llegar HoraFin ({_config.HoraFin}).");
+            return;
+        }
 
-        // Publicar evento de sesión finalizada (si el agente no lo hizo)
         await PublicarEventoAsync(ctx.SessionId, AgentEventTypes.SesionFinalizada, new
         {
-            sessionId      = ctx.SessionId,
-            fecha          = ctx.Fecha,
-            iteraciones    = ctx.IteracionActual,
-            finalizado     = ctx.FinalizarRequested,
-            mensajeFinal   = ctx.MensajeFinal
+            sessionId    = ctx.SessionId,
+            fecha        = ctx.Fecha,
+            iteraciones  = ctx.IteracionActual,
+            finalizado   = ctx.FinalizarRequested,
+            mensajeFinal = ctx.MensajeFinal
         }, ct);
 
-        // Esperar hasta el próximo ciclo diario
-        var espera = CalcularEsperaProximoCiclo();
-        _logger.LogInformation(
-            "Ciclo completado. Próximo ciclo en {Horas:F1} horas (a las {Hora}).",
-            espera.TotalHours, _config.HoraInicio);
-
-        await Task.Delay(espera, ct);
+        _logger.LogInformation("Ciclo completado. El worker esperará hasta la próxima ventana ({Inicio}).", _config.HoraInicio);
     }
 
     // ──────────────────────────────────────────────────────────
@@ -171,17 +189,52 @@ public class MigrationMonitorWorker : BackgroundService
         catch { /* silenciar */ }
     }
 
-    private TimeSpan CalcularEsperaProximoCiclo()
+    /// <summary>
+    /// Devuelve true si la hora actual está dentro de la ventana [HoraInicio, HoraFin].
+    /// Maneja el cruce de medianoche (ej: 22:55 → 00:10).
+    /// </summary>
+    private bool EstaEnVentana()
     {
-        var ahora      = TimeOnly.FromDateTime(DateTime.Now);
-        var horaInicio = _config.HoraInicio;
+        var ahora  = TimeOnly.FromDateTime(DateTime.Now);
+        var inicio = _config.HoraInicio;
+        var fin    = _config.HoraFin;
 
-        TimeSpan espera;
-        if (ahora < horaInicio)
-            espera = horaInicio.ToTimeSpan() - ahora.ToTimeSpan();
-        else
-            espera = TimeSpan.FromHours(24) - ahora.ToTimeSpan() + horaInicio.ToTimeSpan();
+        return inicio <= fin
+            ? ahora >= inicio && ahora <= fin          // sin cruce de medianoche
+            : ahora >= inicio || ahora <= fin;         // con cruce de medianoche
+    }
+
+    /// <summary>
+    /// Tiempo que falta para que comience la próxima ventana.
+    /// Devuelve Zero si ya estamos dentro de la ventana.
+    /// </summary>
+    private TimeSpan CalcularEsperaHastaInicio()
+    {
+        if (EstaEnVentana()) return TimeSpan.Zero;
+
+        var ahora  = TimeOnly.FromDateTime(DateTime.Now);
+        var inicio = _config.HoraInicio;
+
+        var espera = ahora < inicio
+            ? inicio.ToTimeSpan() - ahora.ToTimeSpan()
+            : TimeSpan.FromHours(24) - ahora.ToTimeSpan() + inicio.ToTimeSpan();
 
         return espera < TimeSpan.FromMinutes(1) ? TimeSpan.FromMinutes(1) : espera;
+    }
+
+    /// <summary>
+    /// Tiempo que queda hasta que la ventana cierre (HoraFin).
+    /// Maneja el cruce de medianoche.
+    /// </summary>
+    private TimeSpan CalcularTiempoHastaFin()
+    {
+        var ahora = TimeOnly.FromDateTime(DateTime.Now);
+        var fin   = _config.HoraFin;
+
+        var restante = ahora <= fin
+            ? fin.ToTimeSpan() - ahora.ToTimeSpan()
+            : TimeSpan.FromHours(24) - ahora.ToTimeSpan() + fin.ToTimeSpan();
+
+        return restante < TimeSpan.FromMinutes(1) ? TimeSpan.FromMinutes(1) : restante;
     }
 }

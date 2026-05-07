@@ -2,16 +2,19 @@
 
 ## Objetivo
 
-Agente autónomo de monitoreo que verifica la correcta migración de datos de ventas y devoluciones desde **GK** (punto de venta) hacia **SAP** (ERP). Esta versión evoluciona el proyecto console existente hacia una arquitectura de producción real basada en Worker Service.
+Agente autónomo de monitoreo que verifica la correcta migración de datos de ventas y devoluciones desde **GK** (punto de venta) hacia **SAP** (ERP).
 
-El agente:
-- Percibe el estado de la migración consultando un endpoint REST
-- Razona sobre las discrepancias usando un LLM local (Ollama)
-- Decide si reintentar o finalizar basándose en la respuesta del LLM
-- Actúa notificando por correo al finalizar
-- Recuerda cada iteración en SQLite
-- Publica eventos de negocio en PostgreSQL
-- Itera automáticamente con ciclo diario
+El agente es **verdaderamente autónomo**: el LLM controla el flujo de ejecución mediante tool calling. No es un chatbot ni un wrapper — el LLM decide qué herramienta invocar en cada paso, el runtime la ejecuta, y el LLM decide el siguiente paso basándose en el resultado.
+
+Implementa las 5 primitivas del artículo [Agentes IA Programadores](https://www.webreactiva.com/blog/agentes-ia-programadores):
+
+| Primitiva | Implementación |
+|-----------|---------------|
+| LLM | `IAgentLLMService` → Groq o Claude |
+| Contexto / Instrucciones | `AgentPromptBuilder` + `MigrationPolicy` |
+| Herramientas | 7 implementaciones de `IAgentTool` |
+| Estado / Memoria | `AgentContext` + SQLite (vía herramientas) |
+| Bucle del agente | `MigrationAgent.ExecuteAsync()` |
 
 ---
 
@@ -21,201 +24,154 @@ El agente:
 C:\Projects\agents\
 │
 ├── control de monitoreo gk-sap console\    ← proyecto original (NO MODIFICADO)
-│   ├── Agent.Core\        dominio: interfaces, modelos, agent loop, prompts
-│   ├── Agent.Tools\       servicios: EF Core, SQLite, HTTP client
-│   ├── Agent.Infrastructure\ LLM: Ollama + Mock
-│   └── Agent.Runner\      consola (punto de entrada original)
+│   ├── Agent.Core\        interfaces, modelos, config
+│   ├── Agent.Tools\       API client, validación, SQLite, notificaciones
+│   └── Agent.Infrastructure\ (no usado en este proyecto)
 │
-└── agent worker gk-sap\                    ← ESTE PROYECTO (nuevo)
+└── agent worker gk-sap\                    ← ESTE PROYECTO
     ├── Agent.Worker\
-    │   ├── Interfaces\    IAgentEventStore
-    │   ├── Models\        AgentEvent, AgentEventTypes
-    │   ├── Data\          AgentEventDbContext (PostgreSQL)
-    │   ├── Services\      AgentEventStoreService
+    │   ├── Agents\        MigrationAgent — bucle agente verdadero
+    │   ├── Interfaces\    IAgentLLMService, IAgentTool, IAgentEventStore
+    │   ├── Models\        ChatMessage, ToolCall, AgentContext, AgentEvent...
+    │   ├── Policy\        MigrationPolicy — reglas de negocio como concepto
+    │   ├── Prompts\       AgentPromptBuilder — construye el system prompt
+    │   ├── Tools\         7 herramientas invocables por el LLM
+    │   ├── Services\      GroqAgentLLMService, ClaudeAgentLLMService, AgentEventStoreService
+    │   ├── Data\          AgentEventDbContext (PostgreSQL / SQLite fallback)
     │   ├── Workers\       MigrationMonitorWorker (BackgroundService)
-    │   ├── Program.cs     host con Serilog + DI completo
-    │   └── appsettings.json
+    │   ├── Program.cs
+    │   ├── appsettings.json          ← no se sube a git (tiene API keys)
+    │   └── appsettings.example.json  ← plantilla sin keys (se sube a git)
     ├── AgentWorkerSolution.sln
-    ├── AGENTS.md           (este archivo)
+    ├── AGENTS.md
     └── README.md
 ```
-
-**Principio clave:** Este proyecto **referencia** los .csproj del proyecto console usando rutas relativas. No copia ni duplica lógica. No modifica ningún archivo del proyecto original.
 
 ---
 
 ## Stack Tecnológico
 
-| Capa                   | Tecnología                                               |
-|------------------------|----------------------------------------------------------|
-| Runtime                | .NET 9 / Worker Service (`Microsoft.NET.Sdk.Worker`)    |
-| Agent loop (reutilizado) | `MigrationMonitorAgent` del proyecto console           |
-| LLM                    | Ollama (llama3 o cualquier modelo local)                 |
-| Memoria operacional    | SQLite vía EF Core (`AgentDbContext` del proyecto console)|
-| Eventos consumibles    | PostgreSQL vía EF Core + Npgsql (`AgentEventDbContext`)  |
-| Logs técnicos          | Serilog → consola + Seq                                  |
-| HTTP                   | `HttpClient` vía DI factory                              |
-| Config                 | `appsettings.json` + `IConfiguration`                    |
-| DI                     | `Microsoft.Extensions.Hosting` (IHost)                   |
+| Capa | Tecnología |
+|------|-----------|
+| Runtime | .NET 9 / Worker Service (`Microsoft.NET.Sdk.Worker`) |
+| LLM primario | Claude API (Anthropic) — si `ClaudeApiKey` está configurada |
+| LLM secundario | Groq API (llama-3.1-8b-instant) — si solo `GroqApiKey` está configurada |
+| Selección LLM | Automática por keys presentes: Claude > Groq |
+| Memoria operacional | SQLite vía EF Core (`AgentDbContext` del proyecto console) |
+| Eventos consumibles | PostgreSQL vía EF Core + Npgsql (SQLite como fallback) |
+| Logs técnicos | Serilog → consola + Seq |
 
 ---
 
-## Responsabilidades
-
-### Agent.Worker (este proyecto)
-
-| Componente                    | Responsabilidad                                           |
-|-------------------------------|-----------------------------------------------------------|
-| `Program.cs`                  | Host, DI, Serilog, configuración de todos los servicios  |
-| `MigrationMonitorWorker`      | BackgroundService: ciclo diario, espera horaria, eventos |
-| `IAgentEventStore`            | Contrato para publicar/consumir eventos de negocio       |
-| `AgentEvent` / `AgentEventTypes` | Modelo de evento y catálogo de tipos                  |
-| `AgentEventDbContext`         | DbContext PostgreSQL para eventos consumibles            |
-| `AgentEventStoreService`      | Implementación: publish, get-pending, mark-consumed      |
-
-### Proyectos del console (reutilizados sin modificar)
-
-| Proyecto                    | Qué aporta                                               |
-|-----------------------------|----------------------------------------------------------|
-| `Agent.Core`                | Interfaces, modelos, MigrationMonitorAgent, prompts      |
-| `Agent.Tools`               | MigrationApiClient, validación, SQLite (AgentDbContext)  |
-| `Agent.Infrastructure`      | OllamaLLMService, LLMServiceMock                         |
-
----
-
-## Agent Loop
+## Bucle del Agente (cómo funciona)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                  WORKER LOOP (BackgroundService)                 │
-│                                                                 │
-│  INICIALIZAR                                                    │
-│    └─► SQLite (AgentDbContext del console)                       │
-│    └─► PostgreSQL (AgentEventDbContext del Worker)               │
-│                                                                 │
-│  CICLO DIARIO (se repite indefinidamente)                        │
-│    │                                                            │
-│    ├─► Publicar evento: SesionIniciada                          │
-│    │                                                            │
-│    ├─► [DELEGAR] agent.ExecuteAsync()                           │
-│    │     El agente del console ejecuta internamente:            │
-│    │     ├── percibir: GET endpoint GK/SAP                      │
-│    │     ├── razonar: validar + recuperar historial + LLM       │
-│    │     ├── decidir: REINTENTAR o FINALIZAR                    │
-│    │     ├── actuar: enviar notificación                        │
-│    │     └── recordar: guardar log en SQLite                    │
-│    │                                                            │
-│    ├─► [OBSERVAR] Leer resultado desde SQLite                   │
-│    │     └─► Derivar y publicar eventos consumibles:            │
-│    │           - DiscrepanciaDetectada (si hubo errores)        │
-│    │           - MigracionOk (si todo OK)                       │
-│    │           - LimiteIntentosAlcanzado (si se agotaron)       │
-│    │           - NotificacionEnviada                            │
-│    │           - SesionFinalizada                               │
-│    │                                                            │
-│    └─► Esperar hasta HoraInicio del día siguiente              │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+MigrationMonitorWorker
+    └─► MigrationAgent.ExecuteAsync()
+           │
+           ├─ [1] System prompt: política + herramientas disponibles
+           ├─ [2] User message: "Inicia monitoreo para fecha X"
+           │
+           └─ BUCLE (el LLM controla el flujo):
+                │
+                ├─ LLM recibe mensajes + definiciones de herramientas
+                ├─ LLM responde con tool_calls (nunca texto libre)
+                ├─ Runtime ejecuta cada herramienta
+                ├─ Runtime agrega resultado al historial de mensajes
+                ├─ Si esperar_y_reintentar → Task.Delay + mensaje de contexto
+                ├─ Si finalizar → sale del bucle
+                └─ Repite hasta finalizar o límite de seguridad (50 turnos)
+```
+
+**Percibir → Razonar → Decidir → Actuar → Recordar → Iterar**
+
+---
+
+## Herramientas (Tools)
+
+El LLM puede invocar estas 7 herramientas. Cada una implementa `IAgentTool`.
+
+| Herramienta | Acción real | Resultado |
+|-------------|-------------|-----------|
+| `obtener_estado_migracion` | HTTP GET a la API GK/SAP + análisis | JSON con errores y diferencias |
+| `registrar_iteracion` | INSERT en SQLite | Confirmación |
+| `obtener_historial_sesion` | SELECT en SQLite | Lista de iteraciones anteriores |
+| `enviar_notificacion` | Llama `INotificationService` | Correo real o simulado |
+| `publicar_evento` | INSERT en PostgreSQL/SQLite | Confirmación |
+| `esperar_y_reintentar` | Señal al runtime para `Task.Delay` | Mensaje de espera |
+| `finalizar` | Señal al runtime para salir del bucle | Mensaje final |
+
+---
+
+## Política (`MigrationPolicy`)
+
+Las reglas de negocio son un concepto de primera clase, no lógica hardcodeada.
+Se embeben en el system prompt para que el LLM las aplique:
+
+- **REINTENTAR**: `CantidadErrores > 0` AND `iteración < MaximoIntentos`
+- **FINALIZAR**: `CantidadErrores == 0` OR `iteración >= MaximoIntentos`
+- Flujo obligatorio: obtener estado → registrar → (esperar si errores) → notificar → publicar evento → finalizar
+
+---
+
+## Selección Automática de LLM
+
+```csharp
+// En Program.cs — prioridad por keys configuradas:
+ClaudeApiKey presente  →  ClaudeAgentLLMService  (claude-haiku-4-5-20251001)
+GroqApiKey presente    →  GroqAgentLLMService    (llama-3.1-8b-instant)
+Ninguna key            →  InvalidOperationException (configuración requerida)
 ```
 
 ---
 
 ## Memoria Operacional (SQLite)
 
-**Origen:** `AgentDbContext` del proyecto console. Este Worker lo configura con `UseSqlite()` en lugar del SQL Server LocalDB que usa el console.
-
-**Connection String:** `Data Source=agent_memory.db`
-
+**Archivo:** `agent_memory.db` (generado en el directorio de ejecución)
 **Tabla:** `MigrationMonitorLogs`
 
-| Columna         | Tipo          | Descripción                          |
-|-----------------|---------------|--------------------------------------|
-| Id              | INTEGER PK    | Auto-incremental                     |
-| SessionId       | TEXT(32)      | GUID de 8 chars de la sesión         |
-| Timestamp       | DATETIME      | UTC                                  |
-| Iteracion       | INTEGER       | Número de intento (1..N)             |
-| TotalTiendas    | INTEGER       | Tiendas comparadas                   |
-| CantidadErrores | INTEGER       | Tiendas con diferencia > tolerancia  |
-| Decision        | TEXT(50)      | "Reintentar" o "Finalizar"           |
-| Mensaje         | TEXT(1000)    | Razonamiento del LLM (truncado)      |
-| DiferenciaTotal | DECIMAL(18,2) | Suma total de diferencias            |
+| Columna | Tipo | Descripción |
+|---------|------|-------------|
+| SessionId | TEXT | ID de la sesión (8 chars) |
+| Iteracion | INTEGER | Número de intento |
+| CantidadErrores | INTEGER | Tiendas con discrepancia |
+| Decision | TEXT | `REINTENTAR` o `FINALIZAR` |
+| Mensaje | TEXT | Razonamiento del LLM |
+| DiferenciaTotal | DECIMAL | Suma de diferencias monetarias |
+| Timestamp | DATETIME | UTC |
 
 ---
 
-## Eventos Consumibles (PostgreSQL)
+## Eventos Consumibles (PostgreSQL / SQLite fallback)
 
-**Origen:** `AgentEventDbContext` propio de este Worker. Permite a sistemas externos consumir eventos de negocio del agente.
-
-**Connection String:** `Host=localhost;Port=5432;Database=agent_events;Username=postgres;Password=postgres`
-
+**Archivo fallback:** `agent_events_fallback.db`
 **Tabla:** `AgentEvents`
 
-| Columna    | Tipo      | Descripción                               |
-|------------|-----------|-------------------------------------------|
-| Id         | SERIAL PK | Auto-incremental                          |
-| SessionId  | TEXT      | GUID de la sesión                         |
-| EventType  | TEXT      | Tipo de evento (ver catálogo)             |
-| Payload    | TEXT      | JSON con datos del evento                 |
-| Timestamp  | TIMESTAMP | UTC                                       |
-| Consumed   | BOOLEAN   | Si fue procesado por un consumidor        |
-| ConsumedAt | TIMESTAMP | Cuándo fue consumido (nullable)           |
-
-**Catálogo de eventos:**
-
-| EventType                  | Cuándo se publica                                     |
-|----------------------------|-------------------------------------------------------|
-| `SesionIniciada`           | Al inicio de cada ciclo diario                        |
-| `DiscrepanciaDetectada`    | Si hubo iteraciones con errores en la sesión          |
-| `MigracionOk`              | Si la sesión finalizó sin discrepancias               |
-| `LimiteIntentosAlcanzado`  | Si se agotaron los intentos sin resolver              |
-| `NotificacionEnviada`      | Al finalizar cada sesión (siempre)                    |
-| `SesionFinalizada`         | Resumen final de la sesión                            |
-| `ErrorCiclo`               | Si ocurre un error inesperado en el ciclo del Worker  |
+| EventType | Cuándo |
+|-----------|--------|
+| `SesionIniciada` | Al inicio del ciclo |
+| `MigracionOk` | Finaliza sin errores |
+| `LimiteIntentosAlcanzado` | Se agotaron los intentos |
+| `DiscrepanciaDetectada` | Se detectaron errores en alguna iteración |
+| `NotificacionEnviada` | Al enviar notificación |
+| `SesionFinalizada` | Resumen final |
+| `ErrorCiclo` | Error inesperado en el Worker |
 
 ---
 
-## Observabilidad — Seq
-
-**Propósito:** Únicamente logs técnicos. No se usa como memoria ni como event bus.
-
-**Qué se registra:**
-- Arranque y detención del Worker
-- Inicio/fin de cada ciclo diario
-- Inicialización de bases de datos
-- Errores y excepciones con stack trace
-- Advertencias de disponibilidad (PostgreSQL, Ollama)
-- Tiempos y métricas de ejecución
-
-**Propiedades enriquecidas:**
-- `Application`: `MonitorMigracionGkSap-Worker`
-- `EnvironmentName`: nombre del entorno
-- `MachineName`: nombre del host
-
----
-
-## Uso de Ollama
-
-El agente delega las decisiones al LLM local. Sin Ollama, usar `LLM:Provider = "Mock"`.
-
-**Flujo del prompt (en proyecto console, sin modificar):**
-1. `MigrationPromptBuilder` construye el prompt con análisis + historial
-2. `OllamaLLMService` llama a `POST /api/generate`
-3. `MigrationDecisionParser` extrae `ACCION: REINTENTAR|FINALIZAR` + mensaje
-
----
-
-## Configuración Completa
+## Configuración (`appsettings.json`)
 
 ```json
 {
   "ConnectionStrings": {
     "AgentDB":     "Data Source=agent_memory.db",
-    "AgentEvents": "Host=localhost;Port=5432;Database=agent_events;Username=postgres;Password=postgres"
+    "AgentEvents": ""
   },
   "LLM": {
-    "Provider":    "Ollama",
-    "OllamaUrl":   "http://localhost:11434",
-    "OllamaModel": "llama3"
+    "ClaudeApiKey":  "",
+    "ClaudeModel":   "claude-haiku-4-5-20251001",
+    "GroqApiKey":    "",
+    "GroqModel":     "llama-3.1-8b-instant"
   },
   "MigrationMonitor": {
     "IntervaloMinutos":     5,
@@ -224,7 +180,8 @@ El agente delega las decisiones al LLM local. Sin Ollama, usar `LLM:Provider = "
     "MaximoIntentos":       15,
     "Tolerancia":           0.01,
     "ModoSimulacionCorreo": true,
-    "ToAddress":            "destinatario@empresa.com",
+    "ToAddress":            "correo@empresa.com",
+    "EndpointUrl":          "http://servidor/api/endpoint",
     "FechaMonitoreo":       ""
   },
   "Seq": { "Url": "http://localhost:5341" }
@@ -235,34 +192,10 @@ El agente delega las decisiones al LLM local. Sin Ollama, usar `LLM:Provider = "
 
 ## Reglas del Proyecto
 
-1. **NO modificar el proyecto console** — solo referenciar sus .csproj
-2. **Seq es solo para logs técnicos** — no para memoria ni eventos de negocio
-3. **SQLite es la memoria operacional** — historial de iteraciones por sesión
-4. **PostgreSQL es el event bus** — eventos consumibles por sistemas externos
-5. **ModoSimulacionCorreo = true por defecto** — protección contra envíos accidentales
-6. **El LLM decide** — la lógica REINTENTAR/FINALIZAR vive en el agente original
-
----
-
-## Estructura de Carpetas
-
-```
-agent worker gk-sap\
-├── AgentWorkerSolution.sln
-├── AGENTS.md
-├── README.md
-└── Agent.Worker\
-    ├── Agent.Worker.csproj       ← referencias a console via rutas relativas
-    ├── Program.cs                ← host + DI + Serilog
-    ├── appsettings.json
-    ├── Interfaces\
-    │   └── IAgentEventStore.cs
-    ├── Models\
-    │   └── AgentEvent.cs         ← modelo + catálogo de tipos
-    ├── Data\
-    │   └── AgentEventDbContext.cs ← PostgreSQL
-    ├── Services\
-    │   └── AgentEventStoreService.cs
-    └── Workers\
-        └── MigrationMonitorWorker.cs ← BackgroundService
-```
+1. **NO modificar el proyecto console** — solo referenciar sus `.csproj`
+2. **El LLM controla el flujo** — no hay lógica REINTENTAR/FINALIZAR hardcodeada en C#
+3. **`appsettings.json` no se sube a git** — usar `appsettings.example.json` como plantilla
+4. **Seq es solo para logs técnicos** — no para memoria ni eventos de negocio
+5. **SQLite es la memoria operacional** — historial de iteraciones por sesión
+6. **PostgreSQL (o SQLite fallback) es el event bus** — eventos consumibles por otros sistemas
+7. **`ModoSimulacionCorreo = true` por defecto** — protección contra envíos accidentales

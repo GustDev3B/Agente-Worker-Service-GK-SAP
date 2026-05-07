@@ -135,6 +135,8 @@ try
 
     // ── Worker ────────────────────────────────────────────────────────────────
     builder.Services.AddHostedService<MigrationMonitorWorker>();
+    builder.Services.AddWindowsService(options =>
+        options.ServiceName = "MonitorMigracionGkSap");
 
     var host = builder.Build();
     await host.RunAsync();
